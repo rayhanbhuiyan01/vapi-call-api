@@ -178,9 +178,10 @@ export { app, offer, RESOURCE_URL };
 
 // Default export for Vercel: with the Hono framework preset, Vercel treats
 // the root app.mjs as the serverless function entry and requires its default
-// export to be a function (request handler). app.fetch is the bound Hono
-// request handler — the same handler api/index.js exports. Without this,
-// the deployment fails with 500 FUNCTION_INVOCATION_FAILED ("Invalid export
-// found in module /var/task/app.mjs. The default export must be a function
-// or server."). No behaviour change: same app, same routes, same x402 offer.
-export default app.fetch;
+// export to be a function (request handler). It must be a ONE-argument
+// function: Vercel decides handler style by arity, and app.fetch takes 3
+// args (request, env, executionCtx), so Vercel called it as a Node
+// (req, res) handler and waited forever for res to finish -> 504
+// FUNCTION_INVOCATION_TIMEOUT. Wrapping it in a 1-arg arrow makes Vercel
+// treat it as a web fetch handler. Same app, routes, price and offer.
+export default (request) => app.fetch(request);
