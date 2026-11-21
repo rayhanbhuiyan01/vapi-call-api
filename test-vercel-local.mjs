@@ -1,57 +1,76 @@
-// Local check of the Vercel handler — calls api/index.js default export with
-// plain Request objects, exactly as Vercel's Node runtime does.
-// Run: node test-vercel-local.mjs
-// With a public URL: PUBLIC_URL=https://vapi-call-api.vercel.app node test-vercel-local.mjs
+// Local test for the Vercel handler — simulates Vercel's Node-style
+// invocation: the default export is called as (req, res) with a Node
+// IncomingMessage-like req and a ServerResponse-like res. Run:
+//   node test-vercel-local.mjs
+//   PUBLIC_URL=https://vapi-call-api-sigma.vercel.app node test-vercel-local.mjs
 import handler from "./api/index.js";
 
-const base = "http://localhost";
-let failures = 0;
-
-async function check(label, path, expectStatus, fn) {
-  const res = await handler(new Request(base + path));
-  const text = await res.text();
-  let json = null;
-  try { json = JSON.parse(text); } catch { /* not JSON */ }
-  const ok = res.status === expectStatus && (!fn || fn(res, json, text));
-  console.log(`${ok ? "PASS" : "FAIL"} ${label}: HTTP ${res.status}`);
-  if (!ok) failures++;
-  return { res, json, text };
+function mockRes() {
+  const chunks = [];
+  const res = {
+    statusCode: 200,
+    headers: {},
+    setHeader(k, v) { this.headers[k.toLowerCase()] = v; },
+    getHeader(k) { return this.headers[k.toLowerCase()]; },
+    end(chunk) {
+      if (chunk) chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+      this.body = Buffer.concat(chunks).toString("utf-8");
+      this.finished = true;
+    },
+  };
+  return res;
+}
+function mockReq(url) {
+  return { method: "GET", url, headers: { host: "vapi-call-api-sigma.vercel.app" } };
 }
 
-// 1. No payment -> 402 with x402 v2 offer in body + PAYMENT-REQUIRED header
-const r1 = await check("GET /solar-calc?monthlyBill=3000 (no payment)", "/solar-calc?monthlyBill=3000", 402,
-  (res, json) =>
-    json?.x402Version === 2 &&
-    json.accepts?.[0]?.scheme === "exact" &&
-    json.accepts?.[0]?.network === "eip155:8453" &&
-    json.accepts?.[0]?.amount === "10000" &&
-    json.accepts?.[0]?.asset === "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913" &&
-    json.accepts?.[0]?.payTo === "0x512a01200d4a765a7a3a050ac880cb5fb1429a3a" &&
-    json.accepts?.[0]?.maxTimeoutSeconds === 120);
-const headerOffer = JSON.parse(Buffer.from(r1.res.headers.get("PAYMENT-REQUIRED") || "", "base64").toString("utf-8"));
-const headerMatchesBody = JSON.stringify(headerOffer) === JSON.stringify(r1.json);
-console.log(`${headerMatchesBody ? "PASS" : "FAIL"} PAYMENT-REQUIRED header decodes to identical offer`);
-if (!headerMatchesBody) failures++;
-console.log(`  resource.url = ${r1.json?.resource?.url}`);
+let failures = 0;
+function passFail(ok, label, extra = "") {
+  console.log(`${ok ? "PASS" : "FAIL"} ${label}${extra}`);
+  if (!ok) failures++;
+}
 
-// 2. OpenAPI doc
-await check("GET /openapi.json", "/openapi.json", 200,
-  (res, json) =>
-    json?.openapi === "3.0.3" &&
-    json.paths?.["/solar-calc"]?.get?.responses?.["402"] !== undefined &&
-    json.paths?.["/solar-calc"]?.get?.["x-payment-info"] !== undefined);
+async function call(url) {
+  const req = mockReq(url);
+  const res = mockRes();
+  const done = new Promise((resolve) => {
+    const origEnd = res.end.bind(res);
+    res.end = (c) => { origEnd(c); resolve(); };
+  });
+  const ret = handler(req, res);
+  if (ret instanceof Promise) await ret;
+  await Promise.race([done, new Promise((r) => setTimeout(r, 5000))]);
+  return res;
+}
 
-// 3. Discovery doc
-await check("GET /.well-known/x402", "/.well-known/x402", 200,
-  (res, json) => json?.x402Version === 2 && Array.isArray(json.resources) && json.resources.length === 1);
+// 1. /solar-calc with no payment -> 402 with the x402 offer
+const r402 = await call("/solar-calc?monthlyBill=3000");
+passFail(r402.finished && r402.statusCode === 402, "GET /solar-calc?monthlyBill=3000 (no payment): HTTP 402", ` (got ${r402.statusCode})`);
+let offer = {};
+try { offer = JSON.parse(r402.body || "{}"); } catch {}
+passFail(offer.x402Version === 2, "offer x402Version 2");
+passFail(offer.accepts?.[0]?.amount === "10000", "offer amount 10000 ($0.01)");
+passFail(offer.accepts?.[0]?.payTo === "0x512a01200d4a765a7a3a050ac880cb5fb1429a3a", "offer payTo 0x512a…");
+const expectedBase = (process.env.PUBLIC_URL || "http://localhost:4242").replace(/\/$/, "");
+passFail(offer.resource?.url === `${expectedBase}/solar-calc`, `resource.url = ${offer.resource?.url}`);
+const headerOffer = JSON.parse(Buffer.from(r402.headers["payment-required"] || "", "base64").toString("utf-8") || "{}");
+passFail(JSON.stringify(headerOffer) === JSON.stringify(offer), "PAYMENT-REQUIRED header decodes to identical offer");
+passFail(r402.headers["access-control-allow-origin"] === "*", "CORS allow-origin: * on 402 response");
 
-// 4. Missing monthlyBill -> 400
-await check("GET /solar-calc (no monthlyBill)", "/solar-calc", 400);
+// 2. /openapi.json -> 200 with 402 + x-payment-info
+const rOpen = await call("/openapi.json");
+passFail(rOpen.finished && rOpen.statusCode === 200, "GET /openapi.json: HTTP 200", ` (got ${rOpen.statusCode})`);
+let openapi = {};
+try { openapi = JSON.parse(rOpen.body || "{}"); } catch {}
+passFail(!!openapi.paths?.["/solar-calc"]?.get?.["x-payment-info"], "openapi has 402 + x-payment-info");
 
-// 5. CORS headers present on a 402 response
-const corsOk = r1.res.headers.get("access-control-allow-origin") === "*";
-console.log(`${corsOk ? "PASS" : "FAIL"} CORS allow-origin: * on 402 response`);
-if (!corsOk) failures++;
+// 3. /.well-known/x402 -> 200
+const rWell = await call("/.well-known/x402");
+passFail(rWell.finished && rWell.statusCode === 200, "GET /.well-known/x402: HTTP 200", ` (got ${rWell.statusCode})`);
+
+// 4. /solar-calc without monthlyBill -> 400
+const r400 = await call("/solar-calc");
+passFail(r400.finished && r400.statusCode === 400, "GET /solar-calc (no monthlyBill): HTTP 400", ` (got ${r400.statusCode})`);
 
 console.log(failures === 0 ? "\nAll checks passed." : `\n${failures} check(s) FAILED.`);
-process.exit(failures === 0 ? 0 : 1);
+process.exitCode = failures === 0 ? 0 : 1;

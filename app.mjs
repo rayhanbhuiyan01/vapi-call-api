@@ -176,12 +176,36 @@ app.get("/solar-calc", async (c) => {
 
 export { app, offer, RESOURCE_URL };
 
-// Default export for Vercel: with the Hono framework preset, Vercel treats
-// the root app.mjs as the serverless function entry and requires its default
-// export to be a function (request handler). It must be a ONE-argument
-// function: Vercel decides handler style by arity, and app.fetch takes 3
-// args (request, env, executionCtx), so Vercel called it as a Node
-// (req, res) handler and waited forever for res to finish -> 504
-// FUNCTION_INVOCATION_TIMEOUT. Wrapping it in a 1-arg arrow makes Vercel
-// treat it as a web fetch handler. Same app, routes, price and offer.
-export default (request) => app.fetch(request);
+// Default export for Vercel: the Node runtime calls the default export as
+// (req, res) => void with a Node IncomingMessage — a returned Response is
+// IGNORED (Vercel warns exactly this) and the request then hangs until the
+// 300s timeout, while Hono crashes on the plain-object headers
+// ("this.raw.headers.get is not a function" in the cors middleware).
+// hono/vercel's handle() does NOT adapt Node req/res (it just calls
+// app.fetch(req)), so this hand-rolled adapter does it: build a web
+// Request from the Node req, run app.fetch, write the Response to res.
+// Same app, routes, price and offer.
+async function vercelHandler(req, res) {
+  const protocol = req.headers["x-forwarded-proto"] || "https";
+  const host = req.headers.host || "localhost";
+  const url = `${protocol}://${host}${req.url}`;
+  const headers = new Headers();
+  for (const [key, value] of Object.entries(req.headers || {})) {
+    if (value === undefined) continue;
+    if (Array.isArray(value)) value.forEach((v) => headers.append(key, v));
+    else headers.set(key, value);
+  }
+  let body;
+  if (req.method !== "GET" && req.method !== "HEAD") {
+    const chunks = [];
+    for await (const chunk of req) chunks.push(chunk);
+    body = Buffer.concat(chunks);
+  }
+  const request = new Request(url, { method: req.method, headers, body });
+  const response = await app.fetch(request);
+  res.statusCode = response.status;
+  response.headers.forEach((value, key) => res.setHeader(key, value));
+  res.end(Buffer.from(await response.arrayBuffer()));
+}
+
+export default vercelHandler;
