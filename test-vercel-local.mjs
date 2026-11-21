@@ -57,16 +57,24 @@ const headerOffer = JSON.parse(Buffer.from(r402.headers["payment-required"] || "
 passFail(JSON.stringify(headerOffer) === JSON.stringify(offer), "PAYMENT-REQUIRED header decodes to identical offer");
 passFail(r402.headers["access-control-allow-origin"] === "*", "CORS allow-origin: * on 402 response");
 
-// 2. /openapi.json -> 200 with 402 + x-payment-info
+// 2. /openapi.json -> 200 with 402 + x-payment-info + 402 content schema
 const rOpen = await call("/openapi.json");
 passFail(rOpen.finished && rOpen.statusCode === 200, "GET /openapi.json: HTTP 200", ` (got ${rOpen.statusCode})`);
 let openapi = {};
 try { openapi = JSON.parse(rOpen.body || "{}"); } catch {}
 passFail(!!openapi.paths?.["/solar-calc"]?.get?.["x-payment-info"], "openapi has 402 + x-payment-info");
+passFail(!!openapi.paths?.["/solar-calc"]?.get?.responses?.["402"]?.content?.["application/json"]?.schema?.$ref, "openapi 402 response has content schema");
 
-// 3. /.well-known/x402 -> 200
+// 3. /.well-known/x402 -> 200, version 1 document listing resources (vAPI wizard check)
 const rWell = await call("/.well-known/x402");
 passFail(rWell.finished && rWell.statusCode === 200, "GET /.well-known/x402: HTTP 200", ` (got ${rWell.statusCode})`);
+let wellKnown = {};
+try { wellKnown = JSON.parse(rWell.body || "{}"); } catch {}
+passFail(wellKnown.x402Version === 1 && Array.isArray(wellKnown.resources) && wellKnown.resources.length === 1, "well-known is x402 v1 doc with 1 resource");
+
+// 5. GET / (origin root, what the vAPI wizard tests) -> 402
+const rRoot = await call("/");
+passFail(rRoot.finished && rRoot.statusCode === 402, "GET / (origin root): HTTP 402", ` (got ${rRoot.statusCode})`);
 
 // 4. /solar-calc without monthlyBill -> 400
 const r400 = await call("/solar-calc");

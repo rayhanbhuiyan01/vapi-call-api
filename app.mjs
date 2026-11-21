@@ -88,13 +88,22 @@ function solarCalc(monthlyBill, roofSqft) {
 
 app.use("*", cors({ origin: "*", exposeHeaders: ["PAYMENT-REQUIRED", "PAYMENT-RESPONSE"] }));
 
+// Root route: the vAPI Add API wizard tests the exact URL entered in
+// Discover (the origin), and requires it to answer 402. There is no free
+// root resource, so the origin itself returns the x402 offer.
+app.get("/", (c) =>
+  c.json(offer, 402, { "PAYMENT-REQUIRED": Buffer.from(JSON.stringify(offer)).toString("base64") })
+);
+
 app.get("/openapi.json", (c) =>
   c.json({
     openapi: "3.0.3",
     info: { title: "ASL Solar Calculator API", version: "1.0.0" },
+    servers: [{ url: BASE_URL }],
     paths: {
       "/solar-calc": {
         get: {
+          operationId: "solarCalc",
           summary: "Estimate a home solar system for Bangladesh",
           parameters: [
             { name: "monthlyBill", in: "query", required: true, schema: { type: "number" }, description: "Monthly electricity bill in BDT" },
@@ -103,7 +112,51 @@ app.get("/openapi.json", (c) =>
           "x-payment-info": offer.accepts[0],
           responses: {
             200: { description: "Solar sizing estimate" },
-            402: { description: "Payment required" },
+            402: {
+              description: "Payment required",
+              content: {
+                "application/json": {
+                  schema: { $ref: "#/components/schemas/PaymentRequired" },
+                },
+              },
+            },
+          },
+        },
+      },
+    },
+    components: {
+      schemas: {
+        PaymentRequired: {
+          type: "object",
+          required: ["x402Version", "accepts"],
+          properties: {
+            x402Version: { type: "integer", example: 2 },
+            error: { type: "string", example: "Payment required" },
+            resource: {
+              type: "object",
+              properties: {
+                url: { type: "string" },
+                description: { type: "string" },
+                mimeType: { type: "string" },
+                serviceName: { type: "string" },
+              },
+            },
+            accepts: {
+              type: "array",
+              items: {
+                type: "object",
+                required: ["scheme", "network", "amount", "asset", "payTo"],
+                properties: {
+                  scheme: { type: "string", example: "exact" },
+                  network: { type: "string", example: "eip155:8453" },
+                  amount: { type: "string", example: "10000" },
+                  asset: { type: "string" },
+                  payTo: { type: "string" },
+                  maxTimeoutSeconds: { type: "integer", example: 120 },
+                  extra: { type: "object" },
+                },
+              },
+            },
           },
         },
       },
@@ -111,13 +164,17 @@ app.get("/openapi.json", (c) =>
   })
 );
 
+// Well-known x402 discovery document. The vAPI wizard checks this as a
+// VERSION 1 x402 document listing resources (its words), so it carries
+// x402Version 1 even though the live payment offer itself is x402 v2.
 app.get("/.well-known/x402", (c) =>
   c.json({
-    x402Version: 2,
+    x402Version: 1,
     resources: [
       {
         url: RESOURCE_URL,
         description: offer.resource.description,
+        mimeType: "application/json",
         accepts: offer.accepts,
       },
     ],
